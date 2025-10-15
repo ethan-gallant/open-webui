@@ -29,7 +29,7 @@ from fastapi import (
     APIRouter,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -409,48 +409,49 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
         try:
             timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-            async with aiohttp.ClientSession(
-                timeout=timeout, trust_env=True
-            ) as session:
-                async with session.post(
-                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-                    json={
-                        "text": payload["input"],
-                        "model_id": request.app.state.config.TTS_MODEL,
-                        "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
-                    },
-                    headers={
-                        "Accept": "audio/mpeg",
-                        "Content-Type": "application/json",
-                        "xi-api-key": request.app.state.config.TTS_API_KEY,
-                    },
-                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                ) as r:
-                    r.raise_for_status()
 
-                    async with aiofiles.open(file_path, "wb") as f:
-                        await f.write(await r.read())
+            async def stream_elevenlabs_audio():
+                """Async generator that streams audio chunks from ElevenLabs"""
+                async with aiohttp.ClientSession(
+                    timeout=timeout, trust_env=True
+                ) as session:
+                    async with session.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream",
+                        json={
+                            "text": payload["input"],
+                            "model_id": request.app.state.config.TTS_MODEL,
+                            "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
+                            "optimize_streaming_latency": 4,  # Maximum streaming optimization
+                        },
+                        headers={
+                            "Accept": "audio/mpeg",
+                            "Content-Type": "application/json",
+                            "xi-api-key": request.app.state.config.TTS_API_KEY,
+                        },
+                        ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    ) as r:
+                        r.raise_for_status()
 
-                    async with aiofiles.open(file_body_path, "w") as f:
-                        await f.write(json.dumps(payload))
+                        # Stream chunks as they arrive
+                        async for chunk in r.content.iter_chunked(1024):
+                            if chunk:
+                                yield chunk
 
-            return FileResponse(file_path)
+            return StreamingResponse(
+                stream_elevenlabs_audio(),
+                media_type="audio/mpeg",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                }
+            )
 
         except Exception as e:
             log.exception(e)
-            detail = None
-
-            try:
-                if r.status != 200:
-                    res = await r.json()
-                    if "error" in res:
-                        detail = f"External: {res['error'].get('message', '')}"
-            except Exception:
-                detail = f"External: {e}"
-
+            detail = f"ElevenLabs Streaming Error: {str(e)}"
             raise HTTPException(
-                status_code=getattr(r, "status", 500) if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
+                status_code=500,
+                detail=detail,
             )
 
     elif request.app.state.config.TTS_ENGINE == "azure":
